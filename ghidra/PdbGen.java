@@ -7,6 +7,7 @@
 
 import java.io.BufferedReader;
 import java.io.FileWriter;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -947,44 +948,51 @@ public class PdbGen extends GhidraScript {
 		String jsonpath = FilenameUtils.removeExtension(exepath).concat(".json");
 
 		updateMonitor("Saving files");
-		FileWriter w = new FileWriter(jsonpath);
-		if (prettyPrint) {
-			Gson gson = new GsonBuilder().setPrettyPrinting().create();
-			JsonElement je = JsonParser.parseString​(json.toString());
-			String prettyJsonString = gson.toJson(je);
-			w.write(prettyJsonString);
-		} else {
-			w.write(json.toString());
+		boolean skipPdbGen = false;
+		try {
+			FileWriter w = new FileWriter(jsonpath);
+			if (prettyPrint) {
+				Gson gson = new GsonBuilder().setPrettyPrinting().create();
+				JsonElement je = JsonParser.parseString​(json.toString());
+				String prettyJsonString = gson.toJson(je);
+				w.write(prettyJsonString);
+			} else {
+				w.write(json.toString());
+			}
+			w.close();
+		} catch (FileNotFoundException e) {
+			skipPdbGen = true;
+			printf("Unable to save: %s\n;", e);
 		}
-		w.close();
-
 		// simple configurable path
 		// Ghidra will cache the default value here, and it will prefer its internal
 		// cached version over our default path :(.
 		// output = askString("location to save", "select a location to save the output
 		// pdb", output);
 
-		ProcessBuilder pdbgen = new ProcessBuilder();
-		pdbgen.command("pdbgen.exe", exepath, "-", "--output", output);
+		if (!skipPdbGen) {
+			ProcessBuilder pdbgen = new ProcessBuilder();
+			pdbgen.command("pdbgen.exe", exepath, "-", "--output", output);
 
-		Process proc = pdbgen.start();
-		PrintWriter stdin = new PrintWriter(proc.getOutputStream());
-		stdin.write(json.toString());
-		stdin.close();
-		while (proc.isAlive()) {
-			updateMonitor("Running pdbgen.exe");
-			if (monitor.isCancelled()) {
-				updateMonitor("Stopping pdbgen.exe");
-				proc.destroy();
-			}
-			for (String line : readAll(proc.getInputStream())) {
-				println(line);
-			}
+			Process proc = pdbgen.start();
+			PrintWriter stdin = new PrintWriter(proc.getOutputStream());
+			stdin.write(json.toString());
+			stdin.close();
+			while (proc.isAlive()) {
+				updateMonitor("Running pdbgen.exe");
+				if (monitor.isCancelled()) {
+					updateMonitor("Stopping pdbgen.exe");
+					proc.destroy();
+				}
+				for (String line : readAll(proc.getInputStream())) {
+					println(line);
+				}
 
-			for (String line : readAll(proc.getErrorStream())) {
-				printerr(line);
+				for (String line : readAll(proc.getErrorStream())) {
+					printerr(line);
+				}
+				Thread.sleep(1);
 			}
-			Thread.sleep(1);
 		}
 		printSectionTimers();
 		return;
