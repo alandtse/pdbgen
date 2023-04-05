@@ -666,6 +666,7 @@ public class PdbGen extends GhidraScript {
 		Iterator<Function> functions = currentProgram.getFunctionManager().getFunctionsNoStubs(true);
 		total = currentProgram.getFunctionManager().getFunctionCount();
 		monitor.initialize(total);
+		item = 0;
 		while (functions.hasNext()) {
 			updateMonitor("Getting functions");
 			Function function = functions.next();
@@ -718,6 +719,7 @@ public class PdbGen extends GhidraScript {
 
 	public List<Symbol> getAllSymbols() throws Exception {
 		List<Symbol> symbols = new ArrayList<Symbol>();
+		monitor.initialize(currentProgram.getSymbolTable().getNumSymbols());
 		item = 0;
 		for (Symbol symbol : currentProgram.getSymbolTable().getAllSymbols(false)) {
 			updateMonitor("Getting Symbols ");
