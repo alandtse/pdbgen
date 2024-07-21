@@ -436,8 +436,11 @@ public class PdbGen extends GhidraScript {
 				return entries;
 			}
 		} else {
-			printf("[PDBGEN] Unknown Type: id=%s, name=%s, class=%s\n", GetId(dt), dt.getName(),
-					dt.getClass().getName());
+			if (dt != null)
+				printf("[PDBGEN] Unknown Type: id=%s, name=%s, class=%s\n", GetId(dt), dt.getName(),
+						dt.getClass().getName());
+			else
+				printf("[PDBGEN] Null Data Type: id=%s\n", GetId(dt));
 		}
 
 		if (json == null) {
@@ -474,8 +477,11 @@ public class PdbGen extends GhidraScript {
 		} else if (dt instanceof BitFieldDataType) {
 			printMissing((BitFieldDataType) dt);
 		} else {
-			printf("[PDBGEN] missing: Unknown data type id='%s', type=%s\n", GetIdUnmapped(dt),
-					dt.getClass().getName());
+			if (dt != null)
+				printf("[PDBGEN] missing: Unknown data type id='%s', type=%s\n", GetIdUnmapped(dt),
+						dt.getClass().getName());
+			else
+				printf("[PDBGEN] missing: Null data type id='%s'\n", GetIdUnmapped(dt));
 		}
 	}
 
