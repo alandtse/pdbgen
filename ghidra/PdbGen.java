@@ -21,10 +21,12 @@ import java.util.Map;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import javax.management.monitor.Monitor;
 
 import org.apache.commons.io.FilenameUtils;
+import org.python.modules.time.Time;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -47,6 +49,7 @@ import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.UniversalID;
+import ghidra.util.exception.CancelledException;
 
 public class PdbGen extends GhidraScript {
 	// Note: we are manually serializing json here, this is just to avoid any
@@ -81,7 +84,7 @@ public class PdbGen extends GhidraScript {
 		return String.format("%02d:%02d:%02d", HH, MM, SS);
 	}
 
-	private void updateMonitor(String status) throws Exception {
+	private void updateMonitor(String status) throws CancelledException {
 		String itemString = "";
 		if (!lastStatus.equals(status)) {
 			// we're in a new section
@@ -98,7 +101,7 @@ public class PdbGen extends GhidraScript {
 		item = item + 1;
 	}
 
-	private void printSectionTimers() throws Exception {
+	private void printSectionTimers() throws CancelledException {
 		if (!lastStatus.isEmpty())
 			sectionTimer.put(lastStatus, Duration.between(sectionStart, Instant.now()));
 		Duration total = Duration.between(start, Instant.now());
@@ -368,7 +371,7 @@ public class PdbGen extends GhidraScript {
 		json.addProperty("id", GetId(x));
 		json.addProperty("name", x.getName());
 		json.addProperty("return_type", GetId(x.getReturnType()));
-		json.addProperty("calling_convention", x.getGenericCallingConvention().toString());
+		json.addProperty("calling_convention", x.getCallingConventionName());
 		json.add("options", new JsonArray());
 		json.add("parameters", parameters);
 		entries.add(json);
@@ -544,9 +547,15 @@ public class PdbGen extends GhidraScript {
 		}
 	}
 
-	public JsonArray toJson(List<DataType> datatypes) throws Exception {
+	public JsonArray toJson(List<DataType> datatypes) throws CancelledException {
+		monitor.setMessage("Extracting DataTypes");
+		monitor.initialize(datatypes.size());
+		monitor.setIndeterminate(false);
+		monitor.setShowProgressValue(true);
+		monitor.setCancelEnabled(true);
 		// sort so less complex data types are processed first
 		datatypes.sort((a, b) -> Integer.compare(getSize(a), getSize(b)));
+
 		// Build forward declarations for everything, basically because I'm lazy.
 		// We should only need to add forward declarations for data types that have
 		// cyclic dependencies.
@@ -580,6 +589,7 @@ public class PdbGen extends GhidraScript {
 				}
 				setSerialized(dt);
 				changed = true;
+				monitor.incrementProgress(1);
 			}
 
 			if (!changed) {
@@ -730,13 +740,18 @@ public class PdbGen extends GhidraScript {
 		return symbols;
 	}
 
-	public JsonArray toJsonSymbols(List<Symbol> symbols) throws Exception {
+	public JsonArray toJsonSymbols(List<Symbol> symbols) throws CancelledException {
+		monitor.initialize(symbols.size());
+		monitor.setShowProgressValue(true);
+		monitor.setIndeterminate(false);
+		monitor.setCancelEnabled(true);
+
 		JsonArray objs = new JsonArray();
 		FunctionManager manager = currentProgram.getFunctionManager();
 		monitor.initialize(symbols.size());
 		item = 0;
 		for (Symbol symbol : symbols) {
-			updateMonitor("Converting symbols to json");
+			updateMonitor("Extracting Symbols");
 			SymbolType stype = symbol.getSymbolType();
 			// SourceType source = symbol.getSource();
 			Address address = symbol.getAddress();
@@ -973,6 +988,8 @@ public class PdbGen extends GhidraScript {
 		// pdb", output);
 
 		if (!skipPdbGen) {
+			monitor.setIndeterminate(true);
+			monitor.setCancelEnabled(true);
 			ProcessBuilder pdbgen = new ProcessBuilder();
 			pdbgen.command("pdbgen.exe", exepath, "-", "--output", output);
 
@@ -993,7 +1010,7 @@ public class PdbGen extends GhidraScript {
 				for (String line : readAll(proc.getErrorStream())) {
 					printerr(line);
 				}
-				Thread.sleep(1);
+				proc.waitFor(100, TimeUnit.MILLISECONDS);
 			}
 		}
 		printSectionTimers();
