@@ -23,10 +23,7 @@ import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-import javax.management.monitor.Monitor;
-
 import org.apache.commons.io.FilenameUtils;
-import org.python.modules.time.Time;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -38,7 +35,6 @@ import com.google.gson.JsonParser;
 import generic.util.Path;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.services.ConsoleService;
-import ghidra.app.util.datatype.microsoft.GuidDataType;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.data.Enum;
@@ -96,7 +92,7 @@ public class PdbGen extends GhidraScript {
 		if (monitor.isIndeterminate())
 			itemString = item.toString();
 		monitor.setMessage(String.format("%s/%s: %s %s", timeElapsed(sectionStart), timeElapsed(), status, itemString));
-		monitor.checkCanceled();
+		monitor.checkCancelled();
 		monitor.incrementProgress(1);
 		item = item + 1;
 	}
@@ -976,7 +972,7 @@ public class PdbGen extends GhidraScript {
 			FileWriter w = new FileWriter(jsonpath);
 			if (prettyPrint) {
 				Gson gson = new GsonBuilder().setPrettyPrinting().create();
-				JsonElement je = JsonParser.parseString​(json.toString());
+				JsonElement je = JsonParser.parseString(json.toString());
 				String prettyJsonString = gson.toJson(je);
 				w.write(prettyJsonString);
 			} else {
