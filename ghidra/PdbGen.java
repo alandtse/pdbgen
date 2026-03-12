@@ -6,6 +6,7 @@
 //@toolbar
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileWriter;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -13,11 +14,13 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
@@ -51,18 +54,23 @@ public class PdbGen extends GhidraScript {
 	// Note: we are manually serializing json here, this is just to avoid any
 	// dependencies.
 	// this means it will break if we have any fields that need escaping.
-	boolean prettyPrint = true; // output json using pretty print; this results in larger file sizes but may be
-								// easier to read
+	boolean prettyPrint = true;          // output json using pretty print (larger files, easier to debug)
+	boolean filterToFunctionTypes = true; // only emit types reachable from function signatures; cuts PDB size significantly
+	boolean debug = false;               // log every serialized type to console
+	boolean useFallback = false;         // true during Phase 2: substitute placeholders for unresolvable deps
 	Map<String, String> typedefs = new HashMap<String, String>();
-	List<String> serialized = new ArrayList<String>();
+	Set<String> serialized = new HashSet<String>();  // HashSet for O(1) isSerialized() lookup
 	Map<String, String> forwardDeclared = new HashMap<String, String>();
+	Map<Integer, String> placeholderTypeIds = new HashMap<Integer, String>(); // size -> type id for fallback fields
 
 	Map<Address, FunctionDefinition> entrypoints = new HashMap<Address, FunctionDefinition>();
 	Instant start = Instant.now();
 	Instant sectionStart = Instant.now();
 	Integer item = 0;
+	int sectionItemCount = 0;  // items processed in the current section; reset at each section boundary
 	String lastStatus = "";
 	Map<String, Duration> sectionTimer = new LinkedHashMap<String, Duration>();
+	Map<String, Integer> sectionItems  = new LinkedHashMap<String, Integer>();
 
 	private String timeElapsed() {
 		return timeElapsed(start);
@@ -84,9 +92,12 @@ public class PdbGen extends GhidraScript {
 		String itemString = "";
 		if (!lastStatus.equals(status)) {
 			// we're in a new section
-			if (!lastStatus.isEmpty())
+			if (!lastStatus.isEmpty()) {
 				sectionTimer.put(lastStatus, Duration.between(sectionStart, Instant.now()));
+				sectionItems.put(lastStatus, sectionItemCount);
+			}
 			sectionStart = Instant.now();
+			sectionItemCount = 0;
 			lastStatus = status;
 		}
 		if (monitor.isIndeterminate())
@@ -95,19 +106,71 @@ public class PdbGen extends GhidraScript {
 		monitor.checkCancelled();
 		monitor.incrementProgress(1);
 		item = item + 1;
+		sectionItemCount++;
 	}
 
 	private void printSectionTimers() throws CancelledException {
-		if (!lastStatus.isEmpty())
+		if (!lastStatus.isEmpty()) {
 			sectionTimer.put(lastStatus, Duration.between(sectionStart, Instant.now()));
-		Duration total = Duration.between(start, Instant.now());
-		String format = "%-40s%s (%,.2f%%)\n";
-		printf("[PDBGEN] Total Time by Section\n");
-		for (String s : sectionTimer.keySet()) {
-			printf(format, s, toString(sectionTimer.get(s)),
-					(float) sectionTimer.get(s).toSeconds() / total.toSeconds() * 100);
+			sectionItems.put(lastStatus, sectionItemCount);
 		}
-		printf(format, "Total", toString(total), 100.f);
+		Duration total = Duration.between(start, Instant.now());
+		long totalSec = Math.max(total.toSeconds(), 1); // guard against div-by-zero on fast runs
+		int totalItems = 0;
+		for (int n : sectionItems.values()) totalItems += n;
+
+		String fmt = "  %-42s%-12s%,10d   %.1f%%\n";
+		String fmtTotal = "  %-42s%-12s%,10d\n";
+		printf("[PDBGEN] Total Time by Section\n");
+		printf("  %-42s%-12s%10s   %s\n", "Phase", "Time", "Items", "%");
+		printf("  %s\n", "-".repeat(74));
+		for (String s : sectionTimer.keySet()) {
+			int items = sectionItems.getOrDefault(s, 0);
+			printf(fmt, s, toString(sectionTimer.get(s)), items,
+					(float) sectionTimer.get(s).toSeconds() / totalSec * 100);
+		}
+		printf("  %s\n", "-".repeat(74));
+		printf(fmtTotal, "Total", toString(total), totalItems);
+	}
+
+	private void printPdbSummary(String pdbPath, JsonObject data) {
+		JsonArray types   = data.get("types").getAsJsonArray();
+		JsonArray symbols = data.get("symbols").getAsJsonArray();
+
+		int pubFunctions = 0, pubData = 0, gproc = 0;
+		for (JsonElement el : symbols) {
+			JsonObject sym = el.getAsJsonObject();
+			String type = sym.get("type").getAsString();
+			if ("S_PUB32".equals(type)) {
+				if (sym.has("function") && sym.get("function").getAsBoolean()) pubFunctions++;
+				else pubData++;
+			} else if ("S_GPROC32".equals(type)) {
+				gproc++;
+			}
+		}
+
+		String sizeStr;
+		File pdb = new File(pdbPath);
+		if (pdb.exists()) {
+			long bytes = pdb.length();
+			if (bytes >= 1024L * 1024 * 1024)
+				sizeStr = String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+			else if (bytes >= 1024 * 1024)
+				sizeStr = String.format("%.2f MB", bytes / (1024.0 * 1024));
+			else if (bytes >= 1024)
+				sizeStr = String.format("%.1f KB", bytes / 1024.0);
+			else
+				sizeStr = String.format("%d B", bytes);
+		} else {
+			sizeStr = "not found";
+		}
+
+		printf("[PDBGEN] PDB Output Summary\n");
+		printf("  %-32s%,d\n",  "Types emitted:",               types.size());
+		printf("  %-32s%,d\n",  "Public functions (S_PUB32):",  pubFunctions);
+		printf("  %-32s%,d\n",  "Public data (S_PUB32):",       pubData);
+		printf("  %-32s%,d\n",  "Full procedures (S_GPROC32):", gproc);
+		printf("  %-32s%s\n",   "PDB file size:",               sizeStr);
 	}
 
 	private int getSize(DataType dt) {
@@ -215,15 +278,56 @@ public class PdbGen extends GhidraScript {
 		return forwardDeclared.get(id);
 	}
 
-	private JsonObject dump(Pointer x) {
-		if (!isSerialized(x.getDataType()))
-			return null;
-
+	private List<JsonObject> dump(Pointer x) {
+		List<JsonObject> entries = new ArrayList<JsonObject>();
+		String referentId;
+		if (!isSerialized(x.getDataType())) {
+			if (!useFallback) return null;
+			DataType referent = x.getDataType();
+			if (referent instanceof Structure || referent instanceof Union || referent instanceof Enum) {
+				// Emit a named forward declaration so the pointer keeps its type name.
+				// Debuggers and RTTI can then reconnect the type by name if its full
+				// definition is found later (e.g. via RTTI discovery).
+				referentId = GetId(referent);
+				if (!isSerialized(referentId)) {
+					JsonObject fwd = new JsonObject();
+					fwd.addProperty("id", referentId);
+					fwd.addProperty("name", referent.getName());
+					fwd.addProperty("unique_name", GetFwdId(referent));
+					fwd.addProperty("size", 0);
+					JsonArray opts = new JsonArray();
+					opts.add("forwardref");
+					fwd.add("options", opts);
+					fwd.add("fields", new JsonArray());
+					if (referent instanceof Enum) {
+						fwd.addProperty("type", "LF_ENUM");
+						fwd.addProperty("underlying_type", "0x0000");
+					} else if (referent instanceof Union) {
+						fwd.addProperty("type", "LF_UNION");
+					} else {
+						fwd.addProperty("type", "LF_STRUCTURE");
+					}
+					entries.add(fwd); // must precede the pointer entry in the type stream
+					serialized.add(referentId);
+					printf("[PDBGEN] fallback: emitting named forward decl for '%s' (referenced by pointer)\n",
+							referent.getName());
+				}
+			} else {
+				// Non-composite referent (e.g. function pointer chain, unknown primitive):
+				// void* is the safest fallback and loses no useful name.
+				printf("[PDBGEN] fallback: pointer referent '%s' unresolvable, using void*\n",
+						GetIdUnmapped(referent));
+				referentId = "0x0003"; // void
+			}
+		} else {
+			referentId = GetId(x.getDataType());
+		}
 		JsonObject json = new JsonObject();
 		json.addProperty("id", GetId(x));
 		json.addProperty("type", "LF_POINTER");
-		json.addProperty("referent_type", GetId(x.getDataType()));
-		return json;
+		json.addProperty("referent_type", referentId);
+		entries.add(json);
+		return entries;
 	}
 
 	private JsonObject dump(Array x) {
@@ -243,13 +347,21 @@ public class PdbGen extends GhidraScript {
 	private JsonObject dump(Union x) {
 		JsonArray members = new JsonArray();
 		for (DataTypeComponent dt : x.getComponents()) {
-			if (!isSerialized(dt.getDataType()))
-				return null;
+			String typeId;
+			if (!isSerialized(dt.getDataType())) {
+				if (!useFallback) return null;
+				int size = dt.getLength();
+				String name = dt.getFieldName() != null ? dt.getFieldName() : dt.getDefaultFieldName();
+				printf("[PDBGEN] fallback: union '%s' field '%s' type '%s' unresolvable, using %d-byte placeholder\n",
+						x.getName(), name, GetIdUnmapped(dt.getDataType()), size);
+				typeId = getPlaceholderTypeId(size);
+			} else {
+				typeId = GetId(dt.getDataType());
+			}
 			JsonObject json = new JsonObject();
 			json.addProperty("type", "LF_MEMBER");
-			// TODO currently this is set to QWORD, is this different for x86/x64?
 			json.addProperty("name", dt.getFieldName());
-			json.addProperty("type_id", GetId(dt.getDataType()));
+			json.addProperty("type_id", typeId);
 			json.addProperty("offset", dt.getOffset());
 			json.add("attributes", new JsonArray());
 			members.add(json);
@@ -289,13 +401,21 @@ public class PdbGen extends GhidraScript {
 	private JsonObject dump(Structure x) {
 		JsonArray fields = new JsonArray();
 		for (DataTypeComponent dt : x.getComponents()) {
+			String typeId;
 			if (!isSerialized(dt.getDataType())) {
-				return null;
+				if (!useFallback) return null;
+				int size = dt.getLength();
+				String name = dt.getFieldName() != null ? dt.getFieldName() : dt.getDefaultFieldName();
+				printf("[PDBGEN] fallback: struct '%s' field '%s' type '%s' unresolvable, using %d-byte placeholder\n",
+						x.getName(), name, GetIdUnmapped(dt.getDataType()), size);
+				typeId = getPlaceholderTypeId(size);
+			} else {
+				typeId = GetId(dt.getDataType());
 			}
 
 			JsonObject json = new JsonObject();
 			json.addProperty("type", "LF_MEMBER");
-			json.addProperty("type_id", GetId(dt.getDataType()));
+			json.addProperty("type_id", typeId);
 			json.addProperty("offset", dt.getOffset());
 			json.add("attributes", new JsonArray());
 			if (dt.getFieldName() == null) {
@@ -352,13 +472,25 @@ public class PdbGen extends GhidraScript {
 		// x.getClass().getName());
 
 		// we wait (return null) until we have dumped all the dependant types
-		if (!isSerialized(x.getReturnType()))
-			return null;
+		String returnTypeId;
+		if (!isSerialized(x.getReturnType())) {
+			if (!useFallback) return null;
+			printf("[PDBGEN] fallback: function '%s' return type '%s' unresolvable, using void\n",
+					x.getName(), GetIdUnmapped(x.getReturnType()));
+			returnTypeId = "0x0003"; // void
+		} else {
+			returnTypeId = GetId(x.getReturnType());
+		}
 		JsonArray parameters = new JsonArray();
 		for (ParameterDefinition p : x.getArguments()) {
-			if (!isSerialized(p.getDataType()))
-				return null;
-			parameters.add(GetId(p.getDataType()));
+			if (!isSerialized(p.getDataType())) {
+				if (!useFallback) return null;
+				printf("[PDBGEN] fallback: function '%s' param '%s' type '%s' unresolvable, using void*\n",
+						x.getName(), p.getName(), GetIdUnmapped(p.getDataType()));
+				parameters.add("0x0603"); // void* (64-bit pointer to void)
+			} else {
+				parameters.add(GetId(p.getDataType()));
+			}
 		}
 		List<JsonObject> entries = new ArrayList<JsonObject>();
 
@@ -366,7 +498,7 @@ public class PdbGen extends GhidraScript {
 		json.addProperty("type", "LF_PROCEDURE");
 		json.addProperty("id", GetId(x));
 		json.addProperty("name", x.getName());
-		json.addProperty("return_type", GetId(x.getReturnType()));
+		json.addProperty("return_type", returnTypeId);
 		json.addProperty("calling_convention", x.getCallingConventionName());
 		json.add("options", new JsonArray());
 		json.add("parameters", parameters);
@@ -400,12 +532,13 @@ public class PdbGen extends GhidraScript {
 		if (dt instanceof FunctionDefinition) {
 			return dump((FunctionDefinition) dt);
 		}
+		if (dt instanceof Pointer) {
+			return dump((Pointer) dt);
+		}
 
 		List<JsonObject> entries = new ArrayList<JsonObject>();
 		JsonObject json = null;
-		if (dt instanceof Pointer) {
-			json = dump((Pointer) dt);
-		} else if (dt instanceof BitFieldDataType) {
+		if (dt instanceof BitFieldDataType) {
 			json = dump((BitFieldDataType) dt);
 		} else if (dt instanceof Array) {
 			json = dump((Array) dt);
@@ -584,7 +717,7 @@ public class PdbGen extends GhidraScript {
 					continue; // waiting for dependencies to added first
 				}
 
-				printf("[PDBGEN] dumped: id=%s, original=%s\n", GetId(dt), GetIdUnmapped(dt));
+				if (debug) printf("[PDBGEN] dumped: id=%s, original=%s\n", GetId(dt), GetIdUnmapped(dt));
 				itr.remove();
 				for (JsonObject entry : entries) {
 					json.add(entry);
@@ -602,13 +735,43 @@ public class PdbGen extends GhidraScript {
 		printf("[PDBGEN] datatype deferred serialization %d/%d (%,.2f%%)\n", deferred, total,
 				(float) deferred / total * 100);
 
+		// Phase 2: types still in the list have truly unresolvable deps (e.g. -BAD-
+		// fields, filtered-out types). Pre-emit sized placeholder LF_ARRAY records,
+		// then retry with useFallback=true so each dump() substitutes instead of
+		// returning null.
+		if (!datatypes.isEmpty()) {
+			printf("[PDBGEN] fallback: %d types unresolvable after Phase 1, starting fallback pass\n",
+					datatypes.size());
+			emitPlaceholderArrayTypes(datatypes, json);
+
+			useFallback = true;
+			boolean madeProgress = true;
+			while (madeProgress && !datatypes.isEmpty()) {
+				madeProgress = false;
+				Iterator<DataType> itr2 = datatypes.iterator();
+				while (itr2.hasNext()) {
+					updateMonitor("Fallback serialization");
+					DataType dt = itr2.next();
+					List<JsonObject> entries = toJson(dt);
+					if (entries == null) continue;
+					if (debug) printf("[PDBGEN] fallback dumped: %s\n", GetId(dt));
+					itr2.remove();
+					for (JsonObject entry : entries) json.add(entry);
+					setSerialized(dt);
+					madeProgress = true;
+				}
+			}
+			useFallback = false;
+		}
+
+		// Log anything that even fallback couldn't handle
 		monitor.initialize(datatypes.size());
 		for (DataType dt : datatypes) {
 			updateMonitor("Checking for missing datatypes");
 			printMissing(dt);
 		}
 
-		printf("[PDBGEN] missing: %d\n", datatypes.size());
+		printf("[PDBGEN] missing after fallback: %d\n", datatypes.size());
 		return json;
 	}
 
@@ -655,6 +818,87 @@ public class PdbGen extends GhidraScript {
 			setSerialized(dt);
 		}
 		return objs;
+	}
+
+	// Returns the CodeView type id to use as a sized placeholder in fallback mode.
+	// For sizes matching a primitive (1/2/4/8/16) we reuse that primitive directly.
+	// For other sizes an LF_ARRAY record must have been pre-emitted via
+	// emitPlaceholderArrayTypes() before this is called.
+	private String getPlaceholderTypeId(int size) {
+		switch (size) {
+			case 1:  return "0x0069"; // T_UINT1  (byte)
+			case 2:  return "0x0021"; // T_UINT2  (ushort)
+			case 4:  return "0x0075"; // T_UINT4  (uint)
+			case 8:  return "0x0077"; // T_UINT8  (ulonglong)
+			case 16: return "0x0079"; // T_UINT16 (uint128)
+			default:
+				// non-standard size: look up the pre-emitted LF_ARRAY placeholder
+				return placeholderTypeIds.getOrDefault(size, "0x0077"); // last-resort: ulonglong
+		}
+	}
+
+	// Scans remaining composites for components whose types are still unresolvable,
+	// collects the unique non-primitive sizes, and emits an LF_ARRAY-of-byte record
+	// for each into `into`. Must be called before the Phase 2 fallback loop so the
+	// array types appear earlier in the type stream than the structs that use them.
+	private void emitPlaceholderArrayTypes(List<DataType> remaining, JsonArray into) {
+		Set<Integer> primitives = new HashSet<>();
+		primitives.add(1); primitives.add(2); primitives.add(4); primitives.add(8); primitives.add(16);
+
+		Set<Integer> neededSizes = new HashSet<>();
+		for (DataType dt : remaining) {
+			DataTypeComponent[] components = null;
+			if (dt instanceof Structure)
+				components = ((Structure) dt).getComponents();
+			else if (dt instanceof Union)
+				components = ((Union) dt).getComponents();
+			if (components == null) continue;
+			for (DataTypeComponent c : components) {
+				if (!isSerialized(c.getDataType()) && !primitives.contains(c.getLength()))
+					neededSizes.add(c.getLength());
+			}
+		}
+
+		for (int size : neededSizes) {
+			if (placeholderTypeIds.containsKey(size)) continue;
+			String id = "__placeholder_array_" + size;
+			placeholderTypeIds.put(size, id);
+			serialized.add(id); // mark so struct members can reference it immediately
+			JsonObject arr = new JsonObject();
+			arr.addProperty("id", id);
+			arr.addProperty("type", "LF_ARRAY");
+			arr.addProperty("index_type", "0x0077");
+			arr.addProperty("element_type", "0x0069"); // byte
+			arr.addProperty("size", size);
+			into.add(arr);
+			printf("[PDBGEN] placeholder: emitting %d-byte array type '%s'\n", size, id);
+		}
+	}
+
+	private void collectReachable(DataType dt, Set<DataType> reachable) {
+		if (dt == null || reachable.contains(dt))
+			return;
+		reachable.add(dt);
+		if (dt instanceof FunctionDefinition) {
+			FunctionDefinition fd = (FunctionDefinition) dt;
+			collectReachable(fd.getReturnType(), reachable);
+			for (ParameterDefinition p : fd.getArguments())
+				collectReachable(p.getDataType(), reachable);
+		} else if (dt instanceof Structure) {
+			for (DataTypeComponent c : ((Structure) dt).getComponents())
+				collectReachable(c.getDataType(), reachable);
+		} else if (dt instanceof Union) {
+			for (DataTypeComponent c : ((Union) dt).getComponents())
+				collectReachable(c.getDataType(), reachable);
+		} else if (dt instanceof Array) {
+			collectReachable(((Array) dt).getDataType(), reachable);
+		} else if (dt instanceof Pointer) {
+			collectReachable(((Pointer) dt).getDataType(), reachable);
+		} else if (dt instanceof TypeDef) {
+			collectReachable(((TypeDef) dt).getBaseDataType(), reachable);
+		} else if (dt instanceof BitFieldDataType) {
+			collectReachable(((BitFieldDataType) dt).getBaseDataType(), reachable);
+		}
 	}
 
 	public List<DataType> getAllDataTypes() throws Exception {
@@ -724,6 +968,16 @@ public class PdbGen extends GhidraScript {
 				// typedefs.put(dt.getName(), GetIdUnmapped(basetype));
 				// itr.remove();
 			}
+		}
+
+		if (filterToFunctionTypes) {
+			int before = datatypes.size();
+			Set<DataType> reachable = new HashSet<>();
+			for (FunctionDefinition fd : entrypoints.values())
+				collectReachable(fd, reachable);
+			datatypes.removeIf(dt -> !(dt instanceof FunctionDefinition) && !reachable.contains(dt));
+			printf("[PDBGEN] reachability filter: %d -> %d types (%d functions)\n",
+					before, datatypes.size(), entrypoints.size());
 		}
 
 		return datatypes;
@@ -950,6 +1204,13 @@ public class PdbGen extends GhidraScript {
 		typedefs.clear();
 		serialized.clear();
 		forwardDeclared.clear();
+		placeholderTypeIds.clear();
+		useFallback = false;
+		sectionTimer.clear();
+		sectionItems.clear();
+		sectionItemCount = 0;
+		lastStatus = "";
+		start = Instant.now();
 
 		// setup typedefs so we can map to basic types
 		initializeTypeDefs();
@@ -1016,6 +1277,7 @@ public class PdbGen extends GhidraScript {
 			}
 		}
 		printSectionTimers();
+		printPdbSummary(output, json);
 		return;
 	}
 }
