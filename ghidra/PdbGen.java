@@ -1194,6 +1194,19 @@ public class PdbGen extends GhidraScript {
 		return lines;
 	}
 
+	// Drains all remaining lines from a stream that is known to be at EOF (i.e.
+	// after the process has exited). Unlike readAll(), this blocks until the
+	// stream closes rather than relying on ready(), so no output is lost.
+	public static List<String> readAllBlocking(InputStream in) throws IOException {
+		BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+		List<String> lines = new ArrayList<String>();
+		String line;
+		while ((line = reader.readLine()) != null) {
+			lines.add(line);
+		}
+		return lines;
+	}
+
 	public void run() throws Exception {
 		if (state.getTool() != null) {
 			ConsoleService console = state.getTool().getService(ConsoleService.class);
@@ -1274,6 +1287,17 @@ public class PdbGen extends GhidraScript {
 					printerr(line);
 				}
 				proc.waitFor(100, TimeUnit.MILLISECONDS);
+			}
+			// Drain any output written after the last poll but before process exit.
+			for (String line : readAllBlocking(proc.getInputStream())) {
+				println(line);
+			}
+			for (String line : readAllBlocking(proc.getErrorStream())) {
+				printerr(line);
+			}
+			int exitCode = proc.exitValue();
+			if (exitCode != 0) {
+				printf("[PDBGEN] pdbgen.exe exited with code %d\n", exitCode);
 			}
 		}
 		printSectionTimers();

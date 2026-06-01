@@ -380,23 +380,25 @@ template <> struct nlohmann::adl_serializer<llvm::codeview::CallingConvention> {
     static void to_json(nlohmann::json &json, const llvm::codeview::CallingConvention &record) {}
     static void from_json(const nlohmann::json &json, llvm::codeview::CallingConvention &record) {
         record = llvm::codeview::CallingConvention::FarC;
-        // TODO: this needs be fixed somehow.
-        // Ghidra will use "" or "unknown" if it cant determine to calling convention
-        // msvc seems to be generating "cdecl" in the pdbs for x64
+        // Ghidra may emit convention names with or without the leading "__"
+        // (e.g. "thiscall" and "__thiscall" are both observed in practice).
+        // Strip the prefix before comparing so both forms are accepted.
         for (std::string option : json) {
-            if (option == "__cdecl") {
+            std::string conv = option;
+            if (conv.size() > 2 && conv[0] == '_' && conv[1] == '_')
+                conv = conv.substr(2);
+
+            if (conv == "cdecl") {
                 record = llvm::codeview::CallingConvention::NearC;
-            } else if (option == "__stdcall") {
+            } else if (conv == "stdcall") {
                 record = llvm::codeview::CallingConvention::NearStdCall;
-            } else if (option == "__fastcall") {
+            } else if (conv == "fastcall") {
                 record = llvm::codeview::CallingConvention::NearFast;
-            } else if (option == "__thiscall") {
+            } else if (conv == "thiscall") {
                 record = llvm::codeview::CallingConvention::ThisCall;
-            } else if (option == "syscall") {
+            } else if (conv == "syscall") {
                 record = llvm::codeview::CallingConvention::NearSysCall;
-            } else if (option == "") {
-                record = llvm::codeview::CallingConvention::FarC;
-            } else if (option == "unknown") {
+            } else if (conv == "" || conv == "unknown") {
                 record = llvm::codeview::CallingConvention::FarC;
             } else {
                 std::string err = "unknown calling convention:";
