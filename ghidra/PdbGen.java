@@ -12,7 +12,6 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -1242,8 +1241,7 @@ public class PdbGen extends GhidraScript {
 
 		updateMonitor("Saving files");
 		boolean skipPdbGen = false;
-		try {
-			FileWriter w = new FileWriter(jsonpath);
+		try (FileWriter w = new FileWriter(jsonpath)) {
 			if (prettyPrint) {
 				Gson gson = new GsonBuilder().setPrettyPrinting().create();
 				JsonElement je = JsonParser.parseString(json.toString());
@@ -1252,7 +1250,6 @@ public class PdbGen extends GhidraScript {
 			} else {
 				w.write(json.toString());
 			}
-			w.close();
 		} catch (FileNotFoundException e) {
 			skipPdbGen = true;
 			printf("Unable to save: %s\n;", e);
@@ -1267,12 +1264,11 @@ public class PdbGen extends GhidraScript {
 			monitor.setIndeterminate(true);
 			monitor.setCancelEnabled(true);
 			ProcessBuilder pdbgen = new ProcessBuilder();
-			pdbgen.command("pdbgen.exe", exepath, "-", "--output", output);
+			// Pass the saved JSON file directly — avoids re-serializing and piping
+			// the full JSON through stdin.
+			pdbgen.command("pdbgen.exe", exepath, jsonpath, "--output", output);
 
 			Process proc = pdbgen.start();
-			PrintWriter stdin = new PrintWriter(proc.getOutputStream());
-			stdin.write(json.toString());
-			stdin.close();
 			while (proc.isAlive()) {
 				updateMonitor("Running pdbgen.exe");
 				if (monitor.isCancelled()) {

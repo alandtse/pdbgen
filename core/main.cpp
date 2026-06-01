@@ -38,6 +38,9 @@ llvm::codeview::AppendingTypeTableBuilder ttb_tpi(allocator);
 llvm::codeview::AppendingTypeTableBuilder ttb_ipi(allocator);
 llvm::object::COFFObjectFile *coff = nullptr;
 
+struct SectionInfo { uint64_t start, end; uint16_t segment; };
+std::vector<SectionInfo> section_cache;
+
 std::map<std::string, llvm::codeview::TypeIndex> type_cache;
 
 template <typename R, class FuncTy> void parallelSort(R &&Range, FuncTy Fn) {
@@ -73,16 +76,14 @@ template <typename T> llvm::codeview::TypeIndex insert(std::string key, T &recor
 }
 
 void map_address_to_offset(nlohmann::json json, uint32_t &offset, uint16_t &segment) {
-    // we cant calculate the segment and offset in the decoder because we
-    // dont have access to the coff object...
-    // TODO refactor this!
     uint64_t address = json.get<uint64_t>();
-    for (auto &section : coff->sections()) {
-        uint64_t start = section.getAddress();
-        uint64_t end = start + section.getSize();
-        if (address >= start && address < end) {
-            offset = address - start;
-            segment = section.getIndex() + 1;
+    // Use the pre-built cache — avoids iterating live COFF sections during symbol
+    // processing, which triggers getSectionName in the compiled library and
+    // crashes when the backing MemoryBuffer is no longer accessible at that point.
+    for (const auto &sec : section_cache) {
+        if (address >= sec.start && address < sec.end) {
+            offset = static_cast<uint32_t>(address - sec.start);
+            segment = sec.segment;
             return;
         }
     }
@@ -443,9 +444,10 @@ template <> struct nlohmann::adl_serializer<llvm::pdb::BulkPublic> {
     static void to_json(nlohmann::json &json, const llvm::pdb::BulkPublic &symbol) {}
     static void from_json(const nlohmann::json &json, llvm::pdb::BulkPublic &symbol) {
         std::string name = json["name"].get<std::string>();
-        // to to make a copy of this, as the std::string will be deallocated after the call.
-        symbol.Name = allocator.Allocate<char>(name.size());
-        memcpy((void *)symbol.Name, name.c_str(), name.size());
+        // Copy into the allocator; include the null terminator so strcmp is safe.
+        char *buf = allocator.Allocate<char>(name.size() + 1);
+        memcpy(buf, name.c_str(), name.size() + 1);
+        symbol.Name = buf;
         symbol.NameLen = name.size();
 
         map_address_to_offset(json["address"], symbol.Offset, symbol.Segment);
@@ -598,7 +600,8 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
         std::cin >> json;
     } else {
         std::ifstream json_file(json_path);
-        assert(json_file.is_open());
+        if (!json_file.is_open())
+            throw std::runtime_error("cannot open json file: " + json_path.string());
         json_file >> json;
     }
 
@@ -621,9 +624,27 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
     auto binary = expected->getBinary();
 
     std::cout << "filename=" << exe_path << " type=0x" << std::hex << binary->getType() << std::endl;
-    assert(binary->isCOFF());
+    if (!binary->isCOFF())
+        throw std::runtime_error("executable is not a COFF/PE file: " + exe_path.string());
 
     coff = llvm::dyn_cast<llvm::object::COFFObjectFile>(binary);
+
+    // Build section cache once via index-based access — the compiled library's
+    // section iterator operator++ calls getSectionName internally and crashes on
+    // large PE files, so we bypass the iterator entirely.
+    section_cache.clear();
+    bool isPE = coff->getDOSHeader() != nullptr;
+    uint32_t numSections = coff->getNumberOfSections();
+    for (uint32_t i = 1; i <= numSections; ++i) {
+        auto sec_expected = coff->getSection(i);
+        if (!sec_expected) { consumeError(sec_expected.takeError()); continue; }
+        const llvm::object::coff_section *s = *sec_expected;
+        uint64_t start = static_cast<uint64_t>(s->VirtualAddress) + coff->getImageBase();
+        uint64_t size  = isPE ? std::min(s->VirtualSize, s->SizeOfRawData) : s->SizeOfRawData;
+        section_cache.push_back({start, start + size, static_cast<uint16_t>(i)});
+    }
+    std::cout << "sections: " << std::dec << section_cache.size() << std::endl;
+
     llvm::pdb::InfoStreamBuilder &info = builder.getInfoBuilder();
     llvm::pdb::DbiStreamBuilder &dbi = builder.getDbiBuilder();
 
@@ -967,12 +988,11 @@ int main(int argc, char **argv) {
 
     try {
         return process(exe, json, pdb);
-        std::cout << "done!" << std::endl;
-    } catch (nlohmann::json::exception e) {
-        std::cout << "failed to parse json" << e.what() << std::endl;
+    } catch (const nlohmann::json::exception& e) {
+        std::cout << "failed to parse json: " << e.what() << std::endl;
         return -1;
-    } catch (std::exception e) {
-        std::cout << "unknown error:" << e.what() << std::endl;
+    } catch (const std::exception& e) {
+        std::cout << "unknown error: " << e.what() << std::endl;
         return -2;
     }
 }
