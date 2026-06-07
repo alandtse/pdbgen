@@ -903,16 +903,31 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
         gsi.addPublicSymbols(std::move(publics));
     }
 
-    // Add Section Map stream.
-    // We need to do this because otherwise windbg wont pick up the public symbols (not sure why).
-    auto count = coff->getNumberOfSections();
-    const llvm::object::coff_section *section = nullptr;
-    for (const llvm::object::SectionRef &Sec : coff->sections()) {
-        section = coff->getCOFFSection(Sec);
-        break;
+    // Add Section Map + Section Header streams.
+    // We need this or DIA/windbg won't resolve public symbols by address: DIA uses the section
+    // headers to translate an RVA into the section:offset space the publics live in.
+    //
+    // Build the section-header array via index-based getSection(i), copying each record into a
+    // stable, contiguous vector. The previous code took a single pointer from the coff->sections()
+    // iterator (getCOFFSection) and assumed `count` contiguous records via ArrayRef(firstPtr, count).
+    // On large PE files that pointer is unstable — the iterator's operator++ touches the backing
+    // MemoryBuffer (the same defect noted for map_address_to_offset) — so the SectionHdr stream came
+    // out garbage (.text lost its name, VirtualAddress was random) and findSymbolByRVA failed for
+    // every frame ("No public symbol found"). Index-based getSection(i) is stable.
+    uint32_t count = coff->getNumberOfSections();
+    std::vector<llvm::object::coff_section> sectionHeaders;
+    sectionHeaders.reserve(count);
+    for (uint32_t i = 1; i <= count; ++i) {
+        auto sec_expected = coff->getSection(i);
+        if (!sec_expected) {
+            consumeError(sec_expected.takeError());
+            continue;
+        }
+        const llvm::object::coff_section *s = *sec_expected;
+        sectionHeaders.push_back(*s);
     }
 
-    llvm::ArrayRef<llvm::object::coff_section> sections(section, count);
+    llvm::ArrayRef<llvm::object::coff_section> sections(sectionHeaders.data(), sectionHeaders.size());
     dbi.createSectionMap(sections);
     auto sectionsTable = llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(sections.begin()),
                                                  reinterpret_cast<const uint8_t *>(sections.end()));
