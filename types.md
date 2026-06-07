@@ -92,7 +92,7 @@ int main() {
 // Global Symbols
 2928 | S_PROCREF [size = 20] `main`
     module = 1, sum name = 0, offset = 312
-    
+
 
 // Public Symbols
 51448 | S_PUB32 [size = 20] `main`
@@ -146,7 +146,7 @@ int main() {
 ```c
 int ExampleGlobalArray[1024];
 ```
-```     
+```
 40 | S_PUB32 [size = 44] `?ExampleGlobalArray@@3PAHA`
     flags = none, addr = 0003:0384
 

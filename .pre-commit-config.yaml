@@ -1,0 +1,13 @@
+# Minimal hooks so pre-commit.ci has a valid config to run. Scoped to this repo's own
+# sources: the vendored LLVM submodule and the LLVM patch file are excluded so upstream
+# content and the whitespace-sensitive patch are never touched.
+exclude: '^extern/|\.patch$'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict

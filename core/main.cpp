@@ -935,7 +935,7 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
 
     // finally save everything out
     ExitOnError(builder.commit(pdb_path.string(), &builder.getInfoBuilder().getGuid()));
-    
+
 
     return 0;
 }
