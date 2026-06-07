@@ -6,16 +6,20 @@ jobs:
   build:
     runs-on: windows-latest
 
-    steps:
-      - uses: actions/checkout@v3
+    # Needed by the release step (softprops/action-gh-release) to create releases.
+    permissions:
+      contents: write
 
-      - uses: actions/checkout@v3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
         with:
           path: llvm
           repository: llvm/llvm-project
           ref: refs/tags/llvmorg-16.0.0
 
-      - uses: actions/cache/restore@v3
+      - uses: actions/cache/restore@v4
         id: cache
         with:
           path: llvm/build
@@ -31,14 +35,15 @@ jobs:
       - name: Initialize LLVM
         if: steps.cache.outputs.cache-hit != 'true'
         shell: cmd
-        run: cmake -B llvm/build -S llvm/llvm 
+        run: cmake -B llvm/build -S llvm/llvm
 
       - name:  Build LLVM
         if: steps.cache.outputs.cache-hit != 'true'
         shell: cmd
         run: cmake --build llvm/build --target llvm-pdbutil  --config Release
 
-      - uses: actions/cache/save@v3
+      - uses: actions/cache/save@v4
+        if: steps.cache.outputs.cache-hit != 'true'
         with:
           path: llvm/build
           key: ${{ steps.cache.outputs.cache-primary-key }}
@@ -55,34 +60,19 @@ jobs:
           copy build/Release/pdbgen.exe assets
           copy ghidra/PdbGen.java assets
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v4
         with:
           name: pdbgen
           path: assets/*
 
-      - run: tar -acvf assets.zip assets/*
-        if: startsWith(github.ref, 'refs/tags/v')
+      # Releases are created only for version tags, and only on this repo — never on
+      # forks or upstream pushes.
+      - name: Package release assets
+        if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'alandtse/pdbgen'
+        run: tar -acvf pdbgen.zip assets/*
 
       - name: Create Release
-        id: create_release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+        if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'alandtse/pdbgen'
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
-      - name: Upload Release Assets
-        id: upload-release-asset 
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
-          asset_path: ./assets.zip
-          asset_name: pdbgen.zip
-          asset_content_type: application/zip
+          files: pdbgen.zip
