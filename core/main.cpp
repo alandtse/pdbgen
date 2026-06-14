@@ -807,6 +807,7 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
 
         llvm::codeview::ProcRefSym pr(llvm::codeview::SymbolKind::S_PROCREF);
 
+        try {
         switch (type) {
         case SymbolType::S_PUB32:
             publics.push_back(std::move(entry.get<llvm::pdb::BulkPublic>()));
@@ -841,6 +842,14 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
         default:
             std::cerr << "unknown symbol type: " << entry << std::endl;
             break;
+        }
+        } catch (const std::runtime_error &e) {
+            // A symbol whose address falls in a BSS / virtual-only region has no file-backed
+            // section offset (section_cache uses min(VirtualSize, SizeOfRawData)) and cannot be
+            // placed in the PDB. Skip it with a warning instead of aborting the whole build --
+            // these are uninitialized-data globals, irrelevant to call-stack symbolication.
+            std::cerr << "[pdbgen] skipping unmappable symbol: " << e.what() << std::endl;
+            continue;
         }
     }
 
