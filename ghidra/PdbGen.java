@@ -24,8 +24,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 
 import org.apache.commons.io.FilenameUtils;
 
@@ -39,6 +37,15 @@ import com.google.gson.JsonParser;
 import generic.util.Path;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.services.ConsoleService;
+import ghidra.app.util.bin.ByteProvider;
+import ghidra.app.util.bin.MemoryByteProvider;
+import ghidra.app.util.bin.format.pe.FileHeader;
+import ghidra.app.util.bin.format.pe.NTHeader;
+import ghidra.app.util.bin.format.pe.OptionalHeader;
+import ghidra.app.util.bin.format.pe.PortableExecutable;
+import ghidra.app.util.bin.format.pe.PortableExecutable.SectionLayout;
+import ghidra.app.util.bin.format.pe.SectionHeader;
+import ghidra.framework.options.Options;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.data.Enum;
@@ -46,6 +53,7 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.FunctionSignature;
 import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.UniversalID;
@@ -135,156 +143,56 @@ public class PdbGen extends GhidraScript {
 	}
 
 	/**
-	 * Ghidra's recorded executable path can go stale if the binary is later renamed or moved
-	 * (e.g. a game exe gets renamed as it's patched: SkyrimSE.1.7.79.exe -> SkyrimSE.1.7.99.exe,
-	 * while Ghidra's project still remembers the old path/name). If the recorded path no longer
-	 * exists, resolve it in two steps: first, search its directory for a same-extension file
-	 * whose MD5 matches the MD5 Ghidra captured at import time (a confirmed match -- but this
-	 * never succeeds for a Steamless-stripped copy, since removing the DRM stub changes the
-	 * bytes even when the underlying game build is identical); failing that, fall back to a
-	 * same-prefix file in the same directory whose PE VersionInfo.FileVersion matches the
-	 * version encoded in the recorded filename (e.g. SkyrimSE.1.7.79.exe -> "1.7.79" must appear
-	 * in the candidate's FileVersion) -- VERSIONINFO survives DRM stripping, so this still gives
-	 * a real, verified signal instead of guessing off the filename alone. Output naming always
-	 * derives from the (possibly stale) recorded path, so concurrent runs against different game
-	 * versions keep distinct output filenames.
+	 * Emits everything pdbgen.exe needs to know about the analyzed binary's PE layout --
+	 * PDB GUID/Age, image base, timestamp, and section headers -- straight from Ghidra's
+	 * own analysis, instead of pdbgen.exe reopening the exe from disk to get them.
+	 *
+	 * That disk re-read was the root cause of a whole class of bugs this session: Ghidra's
+	 * analyzed bytes are frozen at import time, but the exe on disk can be renamed, patched,
+	 * or DRM-stripped afterward without Ghidra's recorded path ever being updated, so a
+	 * naive re-read either fails outright (file no longer exists there) or silently embeds
+	 * a mismatched GUID from whatever now happens to be at that path. Sourcing everything
+	 * from Ghidra removes the dependency on the exe existing on disk at all -- the exe
+	 * argument to pdbgen.exe is gone entirely; only the JSON is needed now.
+	 *
+	 * GUID/Age come from Program Info ("PDB GUID"/"PDB Age", populated by Ghidra's PE loader
+	 * from the CodeView debug directory at import time). Section headers and the image
+	 * timestamp are re-derived by re-running Ghidra's own PE parser
+	 * (ghidra.app.util.bin.format.pe.PortableExecutable) directly over the program's
+	 * in-memory image via MemoryByteProvider -- this is the same parser Ghidra used at
+	 * import time, just pointed at the analyzed bytes instead of a file on disk.
 	 */
-	private String resolveExecutablePath(String recordedPath) {
-		File recorded = new File(recordedPath);
-		if (recorded.exists()) {
-			return recordedPath;
+	private void addPeMetadata(JsonObject json) throws IOException {
+		Options info = currentProgram.getOptions(Program.PROGRAM_INFO);
+		String guid = info.getValueAsString("PDB GUID");
+		String ageStr = info.getValueAsString("PDB Age");
+		if (guid == null || ageStr == null) {
+			throw new IOException("Program Info is missing PDB GUID/Age -- is this a PE binary with CodeView debug info?");
 		}
+		json.addProperty("pdb_guid", guid);
+		json.addProperty("pdb_age", Integer.parseInt(ageStr.trim()));
 
-		String expectedMd5 = currentProgram.getExecutableMD5();
-		File dir = recorded.getParentFile();
-		if (expectedMd5 == null || dir == null || !dir.isDirectory()) {
-			return null;
-		}
+		ByteProvider bp = new MemoryByteProvider(currentProgram.getMemory(), currentProgram.getImageBase());
+		PortableExecutable pe = new PortableExecutable(bp, SectionLayout.MEMORY);
+		NTHeader nt = pe.getNTHeader();
+		FileHeader fh = nt.getFileHeader();
+		OptionalHeader oh = nt.getOptionalHeader();
 
-		String ext = FilenameUtils.getExtension(recordedPath).toLowerCase();
-		File[] candidates = dir.listFiles((d, name) -> ext.isEmpty() || name.toLowerCase().endsWith("." + ext));
-		if (candidates == null) {
-			return null;
-		}
+		json.addProperty("image_base", oh.getImageBase());
+		json.addProperty("time_date_stamp", fh.getTimeDateStamp());
+		json.addProperty("is64", (fh.getMachine() & 0xFFFF) == 0x8664); // IMAGE_FILE_MACHINE_AMD64
 
-		String match = null;
-		for (File candidate : candidates) {
-			try {
-				if (expectedMd5.equalsIgnoreCase(md5(candidate))) {
-					if (match != null) {
-						printf("[PDBGEN] WARNING: multiple files match MD5 for stale path '%s': %s and %s -- refusing to guess\n",
-								recordedPath, match, candidate);
-						return null;
-					}
-					match = candidate.getAbsolutePath();
-				}
-			} catch (IOException e) {
-				printf("[PDBGEN] WARNING: failed to hash %s: %s\n", candidate, e);
-			}
+		JsonArray sections = new JsonArray();
+		for (SectionHeader s : fh.getSectionHeaders()) {
+			JsonObject sec = new JsonObject();
+			sec.addProperty("name", s.getName());
+			sec.addProperty("virtual_address", s.getVirtualAddress());
+			sec.addProperty("virtual_size", s.getVirtualSize());
+			sec.addProperty("size_of_raw_data", s.getSizeOfRawData());
+			sec.addProperty("characteristics", s.getCharacteristics());
+			sections.add(sec);
 		}
-
-		if (match != null) {
-			printf("[PDBGEN] recorded executable path is stale ('%s' no longer exists); resolved actual file by MD5 match: %s\n",
-					recordedPath, match);
-			return match;
-		}
-
-		// Last resort: the recorded filename encodes a game version (e.g. SkyrimSE.1.7.79.exe
-		// or SkyrimSE.1170.exe). Look for a same-prefix candidate whose actual PE FileVersion
-		// resource contains that version -- unlike a bare filename guess, this is still a real
-		// (if weaker than MD5) confirmation, and it works across DRM stripping.
-		String baseName = FilenameUtils.getBaseName(recordedPath);
-		int firstDot = baseName.indexOf('.');
-		if (firstDot < 0) {
-			return null;
-		}
-		String prefix = baseName.substring(0, firstDot);
-		String versionToken = baseName.substring(firstDot + 1);
-
-		String versionMatch = null;
-		for (File candidate : candidates) {
-			if (!candidate.getName().startsWith(prefix)) {
-				continue;
-			}
-			String fileVersion = getFileVersion(candidate);
-			if (fileVersion == null || !versionContains(fileVersion, versionToken)) {
-				continue;
-			}
-			if (versionMatch != null) {
-				printf("[PDBGEN] WARNING: multiple files match version '%s' for stale path '%s' -- refusing to guess\n",
-						versionToken, recordedPath);
-				return null;
-			}
-			versionMatch = candidate.getAbsolutePath();
-		}
-
-		if (versionMatch != null) {
-			printf("[PDBGEN] no MD5 match for stale path '%s' (expected after Steamless DRM stripping); resolved by FileVersion match ('%s'): %s\n",
-					recordedPath, versionToken, versionMatch);
-		}
-		return versionMatch;
-	}
-
-	// Reads the PE VersionInfo.FileVersion of a file via PowerShell, since the JDK has no
-	// built-in way to read Win32 file version resources. Returns null on any failure.
-	private static String getFileVersion(File file) {
-		try {
-			String escaped = file.getAbsolutePath().replace("'", "''");
-			ProcessBuilder pb = new ProcessBuilder("powershell", "-NoProfile", "-NonInteractive", "-Command",
-					"(Get-Item -LiteralPath '" + escaped + "').VersionInfo.FileVersion");
-			pb.redirectErrorStream(true);
-			Process p = pb.start();
-			String line;
-			try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-				line = r.readLine();
-			}
-			p.waitFor(5, TimeUnit.SECONDS);
-			return line == null || line.isBlank() ? null : line.trim();
-		} catch (Exception e) {
-			return null;
-		}
-	}
-
-	// True if the dot-separated numeric components of `token` (e.g. "1.7.79" or "1170") appear
-	// as a contiguous, ordered run within the dot-separated components of `fileVersion`
-	// (e.g. "1.7.79.0" or "1.6.1170.0"). Plain substring/digit matching would false-positive
-	// across differing naming conventions (dotted SE versions vs bare AE build numbers).
-	private static boolean versionContains(String fileVersion, String token) {
-		String[] a = token.split("[^0-9]+");
-		String[] b = fileVersion.split("[^0-9]+");
-		if (a.length == 0 || a.length > b.length) {
-			return false;
-		}
-		outer:
-		for (int start = 0; start + a.length <= b.length; start++) {
-			for (int i = 0; i < a.length; i++) {
-				if (!a[i].equals(b[start + i])) {
-					continue outer;
-				}
-			}
-			return true;
-		}
-		return false;
-	}
-
-	private static String md5(File file) throws IOException {
-		try {
-			MessageDigest digest = MessageDigest.getInstance("MD5");
-			try (InputStream in = new java.io.FileInputStream(file)) {
-				byte[] buf = new byte[1 << 16];
-				int n;
-				while ((n = in.read(buf)) > 0) {
-					digest.update(buf, 0, n);
-				}
-			}
-			StringBuilder sb = new StringBuilder();
-			for (byte b : digest.digest()) {
-				sb.append(String.format("%02x", b));
-			}
-			return sb.toString();
-		} catch (NoSuchAlgorithmException e) {
-			throw new IOException(e);
-		}
+		json.add("sections", sections);
 	}
 
 	private void printPdbSummary(String pdbPath, JsonObject data) {
@@ -1406,14 +1314,22 @@ public class PdbGen extends GhidraScript {
 
 		// Ghidra has unhelpfully set the path to \C:\\Something\ this gives as a normal
 		// c:\\Something
+		// This is used only to derive output filenames, matching the input program's name --
+		// pdbgen.exe no longer reads the exe itself; see addPeMetadata().
 		String recordedExePath = Path.fromPathString(currentProgram.getExecutablePath()).toString();
 		printf("executable: %s\n", recordedExePath);
 		String output = FilenameUtils.removeExtension(recordedExePath).concat(".pdb");
 		String jsonpath = FilenameUtils.removeExtension(recordedExePath).concat(".json");
-		String exepath = resolveExecutablePath(recordedExePath);
 
 		updateMonitor("Saving files");
 		boolean skipPdbGen = false;
+		try {
+			addPeMetadata(json);
+		} catch (IOException e) {
+			skipPdbGen = true;
+			printf("[PDBGEN] FAILED: could not extract PE metadata: %s\n", e.getMessage());
+		}
+
 		try (FileWriter w = new FileWriter(jsonpath)) {
 			if (prettyPrint) {
 				Gson gson = new GsonBuilder().setPrettyPrinting().create();
@@ -1427,12 +1343,6 @@ public class PdbGen extends GhidraScript {
 			skipPdbGen = true;
 			printf("Unable to save: %s\n;", e);
 		}
-
-		if (exepath == null) {
-			skipPdbGen = true;
-			printf("[PDBGEN] FAILED: executable not found at '%s' and no file in that folder matches this program's MD5 -- skipping pdbgen.exe. JSON was still written to %s\n",
-					recordedExePath, jsonpath);
-		}
 		// simple configurable path
 		// Ghidra will cache the default value here, and it will prefer its internal
 		// cached version over our default path :(.
@@ -1444,8 +1354,8 @@ public class PdbGen extends GhidraScript {
 			monitor.setCancelEnabled(true);
 			ProcessBuilder pdbgen = new ProcessBuilder();
 			// Pass the saved JSON file directly — avoids re-serializing and piping
-			// the full JSON through stdin.
-			pdbgen.command("pdbgen.exe", exepath, jsonpath, "--output", output);
+			// the full JSON through stdin. pdbgen.exe no longer takes an exe path.
+			pdbgen.command("pdbgen.exe", jsonpath, "--output", output);
 
 			Process proc = pdbgen.start();
 			while (proc.isAlive()) {
