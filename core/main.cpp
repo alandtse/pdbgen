@@ -36,10 +36,7 @@ llvm::ExitOnError ExitOnError;
 llvm::BumpPtrAllocator allocator;
 llvm::codeview::AppendingTypeTableBuilder ttb_tpi(allocator);
 llvm::codeview::AppendingTypeTableBuilder ttb_ipi(allocator);
-// Whether the analyzed binary is 64-bit. Previously derived from a COFFObjectFile
-// opened straight from the exe on disk; now sourced from JSON (Ghidra already knows
-// this from its own analysis, and the disk file may not even exist -- see the
-// "process" function for why we stopped reopening the exe at all).
+// Must be set before parsing JSON "types" -- PointerRecord reads it.
 bool g_is64 = false;
 
 struct SectionInfo { uint64_t start, end; uint16_t segment; };
@@ -79,10 +76,7 @@ template <typename T> llvm::codeview::TypeIndex insert(std::string key, T &recor
     return idx;
 }
 
-// Parses a hyphenated GUID string (e.g. "813f85c0-21db-4e71-b66e-5fd21d409629", the
-// format Ghidra's PE loader stores in the "PDB GUID" program property) into the raw
-// 16-byte layout PDB70 debug records use: Data1/Data2/Data3 little-endian, Data4 raw
-// bytes in string order -- the standard Windows GUID binary layout.
+// Windows GUID binary layout: Data1/Data2/Data3 little-endian, Data4 raw byte order.
 llvm::codeview::GUID parseGuid(const std::string &s) {
     std::string hex;
     for (char c : s) {
@@ -644,13 +638,6 @@ int process(std::filesystem::path json_path, std::filesystem::path pdb_path) {
         ExitOnError(builder.getMsfBuilder().addStream(0));
     }
 
-    // PE metadata (GUID/Age/section table/image base) comes straight from the JSON,
-    // which Ghidra populated from its own analysis (PDB GUID/Age from Program Info,
-    // sections re-parsed from Ghidra's in-memory image via its own PE loader) rather
-    // than this tool reopening the exe from disk. Ghidra's analyzed bytes are frozen
-    // at import time; the exe on disk can be renamed, patched, or DRM-stripped after
-    // that without ever going stale here -- there is no longer any dependency on the
-    // exe file existing at all.
     uint64_t image_base = json["image_base"].get<uint64_t>();
     g_is64 = json["is64"].get<bool>();
 
@@ -871,10 +858,8 @@ int process(std::filesystem::path json_path, std::filesystem::path pdb_path) {
             break;
         }
         } catch (const std::runtime_error &e) {
-            // A symbol whose address falls in a BSS / virtual-only region has no file-backed
-            // section offset (section_cache uses min(VirtualSize, SizeOfRawData)) and cannot be
-            // placed in the PDB. Skip it with a warning instead of aborting the whole build --
-            // these are uninitialized-data globals, irrelevant to call-stack symbolication.
+            // BSS/virtual-only addresses have no file-backed section offset; skip rather
+            // than abort the whole build.
             std::cerr << "[pdbgen] skipping unmappable symbol: " << e.what() << std::endl;
             continue;
         }

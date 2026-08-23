@@ -143,24 +143,9 @@ public class PdbGen extends GhidraScript {
 	}
 
 	/**
-	 * Emits everything pdbgen.exe needs to know about the analyzed binary's PE layout --
-	 * PDB GUID/Age, image base, timestamp, and section headers -- straight from Ghidra's
-	 * own analysis, instead of pdbgen.exe reopening the exe from disk to get them.
-	 *
-	 * That disk re-read was the root cause of a whole class of bugs this session: Ghidra's
-	 * analyzed bytes are frozen at import time, but the exe on disk can be renamed, patched,
-	 * or DRM-stripped afterward without Ghidra's recorded path ever being updated, so a
-	 * naive re-read either fails outright (file no longer exists there) or silently embeds
-	 * a mismatched GUID from whatever now happens to be at that path. Sourcing everything
-	 * from Ghidra removes the dependency on the exe existing on disk at all -- the exe
-	 * argument to pdbgen.exe is gone entirely; only the JSON is needed now.
-	 *
-	 * GUID/Age come from Program Info ("PDB GUID"/"PDB Age", populated by Ghidra's PE loader
-	 * from the CodeView debug directory at import time). Section headers and the image
-	 * timestamp are re-derived by re-running Ghidra's own PE parser
-	 * (ghidra.app.util.bin.format.pe.PortableExecutable) directly over the program's
-	 * in-memory image via MemoryByteProvider -- this is the same parser Ghidra used at
-	 * import time, just pointed at the analyzed bytes instead of a file on disk.
+	 * Emits the analyzed binary's PDB GUID/Age (from Program Info) and PE section
+	 * headers/image base/timestamp (re-parsed from Ghidra's in-memory image via
+	 * PortableExecutable) into the JSON, so pdbgen.exe never needs to open the exe itself.
 	 */
 	private void addPeMetadata(JsonObject json) throws IOException {
 		Options info = currentProgram.getOptions(Program.PROGRAM_INFO);
@@ -1090,12 +1075,8 @@ public class PdbGen extends GhidraScript {
 					name = "thunk_" + name;
 				}
 
-				// A function whose entry is not in an executable section cannot be a
-				// CodeView procedure (S_GPROC32 needs a code segment); pdbgen aborts the
-				// entire PDB on the unmappable address. Emit it as a public data symbol so
-				// the name survives and generation continues. Seen for analysis false
-				// positives in .data/.rdata and CommonLib inline accessors whose
-				// RELOCATION_ID points at the singleton/array data they return.
+				// S_GPROC32 needs a code segment; a function outside one aborts pdbgen --
+				// emit as S_PUB32 data instead.
 				ghidra.program.model.mem.MemoryBlock block = currentProgram.getMemory().getBlock(address);
 				if (block == null || !block.isExecute()) {
 					JsonObject data = new JsonObject();
@@ -1314,8 +1295,7 @@ public class PdbGen extends GhidraScript {
 
 		// Ghidra has unhelpfully set the path to \C:\\Something\ this gives as a normal
 		// c:\\Something
-		// This is used only to derive output filenames, matching the input program's name --
-		// pdbgen.exe no longer reads the exe itself; see addPeMetadata().
+		// Used only to derive output filenames -- see addPeMetadata() for the exe's actual data.
 		String recordedExePath = Path.fromPathString(currentProgram.getExecutablePath()).toString();
 		printf("executable: %s\n", recordedExePath);
 		String output = FilenameUtils.removeExtension(recordedExePath).concat(".pdb");
@@ -1354,7 +1334,7 @@ public class PdbGen extends GhidraScript {
 			monitor.setCancelEnabled(true);
 			ProcessBuilder pdbgen = new ProcessBuilder();
 			// Pass the saved JSON file directly — avoids re-serializing and piping
-			// the full JSON through stdin. pdbgen.exe no longer takes an exe path.
+			// the full JSON through stdin.
 			pdbgen.command("pdbgen.exe", jsonpath, "--output", output);
 
 			Process proc = pdbgen.start();
