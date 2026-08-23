@@ -37,6 +37,15 @@ import com.google.gson.JsonParser;
 import generic.util.Path;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.services.ConsoleService;
+import ghidra.app.util.bin.ByteProvider;
+import ghidra.app.util.bin.MemoryByteProvider;
+import ghidra.app.util.bin.format.pe.FileHeader;
+import ghidra.app.util.bin.format.pe.NTHeader;
+import ghidra.app.util.bin.format.pe.OptionalHeader;
+import ghidra.app.util.bin.format.pe.PortableExecutable;
+import ghidra.app.util.bin.format.pe.PortableExecutable.SectionLayout;
+import ghidra.app.util.bin.format.pe.SectionHeader;
+import ghidra.framework.options.Options;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.data.Enum;
@@ -44,6 +53,7 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.FunctionSignature;
 import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.UniversalID;
@@ -130,6 +140,44 @@ public class PdbGen extends GhidraScript {
 		}
 		printf("  %s\n", "-".repeat(74));
 		printf(fmtTotal, "Total", toString(total), totalItems);
+	}
+
+	/**
+	 * Emits the analyzed binary's PDB GUID/Age (from Program Info) and PE section
+	 * headers/image base/timestamp (re-parsed from Ghidra's in-memory image via
+	 * PortableExecutable) into the JSON, so pdbgen.exe never needs to open the exe itself.
+	 */
+	private void addPeMetadata(JsonObject json) throws IOException {
+		Options info = currentProgram.getOptions(Program.PROGRAM_INFO);
+		String guid = info.getValueAsString("PDB GUID");
+		String ageStr = info.getValueAsString("PDB Age");
+		if (guid == null || ageStr == null) {
+			throw new IOException("Program Info is missing PDB GUID/Age -- is this a PE binary with CodeView debug info?");
+		}
+		json.addProperty("pdb_guid", guid);
+		json.addProperty("pdb_age", Integer.parseInt(ageStr.trim()));
+
+		ByteProvider bp = new MemoryByteProvider(currentProgram.getMemory(), currentProgram.getImageBase());
+		PortableExecutable pe = new PortableExecutable(bp, SectionLayout.MEMORY);
+		NTHeader nt = pe.getNTHeader();
+		FileHeader fh = nt.getFileHeader();
+		OptionalHeader oh = nt.getOptionalHeader();
+
+		json.addProperty("image_base", oh.getImageBase());
+		json.addProperty("time_date_stamp", fh.getTimeDateStamp());
+		json.addProperty("is64", (fh.getMachine() & 0xFFFF) == 0x8664); // IMAGE_FILE_MACHINE_AMD64
+
+		JsonArray sections = new JsonArray();
+		for (SectionHeader s : fh.getSectionHeaders()) {
+			JsonObject sec = new JsonObject();
+			sec.addProperty("name", s.getName());
+			sec.addProperty("virtual_address", s.getVirtualAddress());
+			sec.addProperty("virtual_size", s.getVirtualSize());
+			sec.addProperty("size_of_raw_data", s.getSizeOfRawData());
+			sec.addProperty("characteristics", s.getCharacteristics());
+			sections.add(sec);
+		}
+		json.add("sections", sections);
 	}
 
 	private void printPdbSummary(String pdbPath, JsonObject data) {
@@ -1027,6 +1075,19 @@ public class PdbGen extends GhidraScript {
 					name = "thunk_" + name;
 				}
 
+				// S_GPROC32 needs a code segment; a function outside one aborts pdbgen --
+				// emit as S_PUB32 data instead.
+				ghidra.program.model.mem.MemoryBlock block = currentProgram.getMemory().getBlock(address);
+				if (block == null || !block.isExecute()) {
+					JsonObject data = new JsonObject();
+					data.addProperty("type", "S_PUB32");
+					data.addProperty("name", name);
+					data.addProperty("address", address.getUnsignedOffset());
+					data.addProperty("function", false);
+					objs.add(data);
+					continue;
+				}
+
 				JsonObject json = new JsonObject();
 				json.addProperty("type", "S_PUB32");
 				json.addProperty("name", name);
@@ -1234,13 +1295,21 @@ public class PdbGen extends GhidraScript {
 
 		// Ghidra has unhelpfully set the path to \C:\\Something\ this gives as a normal
 		// c:\\Something
-		String exepath = Path.fromPathString(currentProgram.getExecutablePath()).toString();
-		printf("executable: %s\n", exepath);
-		String output = FilenameUtils.removeExtension(exepath).concat(".pdb");
-		String jsonpath = FilenameUtils.removeExtension(exepath).concat(".json");
+		// Used only to derive output filenames -- see addPeMetadata() for the exe's actual data.
+		String recordedExePath = Path.fromPathString(currentProgram.getExecutablePath()).toString();
+		printf("executable: %s\n", recordedExePath);
+		String output = FilenameUtils.removeExtension(recordedExePath).concat(".pdb");
+		String jsonpath = FilenameUtils.removeExtension(recordedExePath).concat(".json");
 
 		updateMonitor("Saving files");
 		boolean skipPdbGen = false;
+		try {
+			addPeMetadata(json);
+		} catch (IOException e) {
+			skipPdbGen = true;
+			printf("[PDBGEN] FAILED: could not extract PE metadata: %s\n", e.getMessage());
+		}
+
 		try (FileWriter w = new FileWriter(jsonpath)) {
 			if (prettyPrint) {
 				Gson gson = new GsonBuilder().setPrettyPrinting().create();
@@ -1266,7 +1335,7 @@ public class PdbGen extends GhidraScript {
 			ProcessBuilder pdbgen = new ProcessBuilder();
 			// Pass the saved JSON file directly — avoids re-serializing and piping
 			// the full JSON through stdin.
-			pdbgen.command("pdbgen.exe", exepath, jsonpath, "--output", output);
+			pdbgen.command("pdbgen.exe", jsonpath, "--output", output);
 
 			Process proc = pdbgen.start();
 			while (proc.isAlive()) {

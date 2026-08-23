@@ -36,7 +36,8 @@ llvm::ExitOnError ExitOnError;
 llvm::BumpPtrAllocator allocator;
 llvm::codeview::AppendingTypeTableBuilder ttb_tpi(allocator);
 llvm::codeview::AppendingTypeTableBuilder ttb_ipi(allocator);
-llvm::object::COFFObjectFile *coff = nullptr;
+// Must be set before parsing JSON "types" -- PointerRecord reads it.
+bool g_is64 = false;
 
 struct SectionInfo { uint64_t start, end; uint16_t segment; };
 std::vector<SectionInfo> section_cache;
@@ -73,6 +74,28 @@ template <typename T> llvm::codeview::TypeIndex insert(std::string key, T &recor
     llvm::codeview::TypeIndex idx = ttb_tpi.writeLeafType(record);
     type_cache[key] = idx;
     return idx;
+}
+
+// Windows GUID binary layout: Data1/Data2/Data3 little-endian, Data4 raw byte order.
+llvm::codeview::GUID parseGuid(const std::string &s) {
+    std::string hex;
+    for (char c : s) {
+        if (c != '-') hex.push_back(c);
+    }
+    if (hex.size() != 32) {
+        throw std::runtime_error("invalid GUID string: " + s);
+    }
+    auto byteAt = [&](size_t i) -> uint8_t {
+        return static_cast<uint8_t>(std::stoul(hex.substr(i * 2, 2), nullptr, 16));
+    };
+    llvm::codeview::GUID guid;
+    guid.Guid[0] = byteAt(3); guid.Guid[1] = byteAt(2); guid.Guid[2] = byteAt(1); guid.Guid[3] = byteAt(0);
+    guid.Guid[4] = byteAt(5); guid.Guid[5] = byteAt(4);
+    guid.Guid[6] = byteAt(7); guid.Guid[7] = byteAt(6);
+    for (int i = 0; i < 8; i++) {
+        guid.Guid[8 + i] = byteAt(8 + i);
+    }
+    return guid;
 }
 
 void map_address_to_offset(nlohmann::json json, uint32_t &offset, uint16_t &segment) {
@@ -189,7 +212,7 @@ template <> struct nlohmann::adl_serializer<llvm::codeview::PointerRecord> {
     static void to_json(nlohmann::json &json, const llvm::codeview::PointerRecord &record) {}
     static void from_json(const nlohmann::json &json, llvm::codeview::PointerRecord &record) {
         record.Kind = llvm::codeview::TypeRecordKind::Pointer;
-        if (coff->is64()) {
+        if (g_is64) {
             record.setAttrs(llvm::codeview::PointerKind::Near64, llvm::codeview::PointerMode::Pointer,
                             llvm::codeview::PointerOptions::None, 8);
         } else {
@@ -593,7 +616,7 @@ static void scopeStackClose(llvm::SmallVectorImpl<SymbolScope> &stack, uint32_t 
 }
 
 // main logic here
-int process(std::filesystem::path exe_path, std::filesystem::path json_path, std::filesystem::path pdb_path) {
+int process(std::filesystem::path json_path, std::filesystem::path pdb_path) {
     nlohmann::json json;
 
     if (json_path.empty()) {
@@ -615,33 +638,38 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
         ExitOnError(builder.getMsfBuilder().addStream(0));
     }
 
-    // we could eliminate the need for this because ghidra has all the required information
-    // however I want to port this to IDA, which discards some of this information after analysis.
-    auto expected = llvm::object::createBinary(exe_path.string());
-    if (!expected) {
-        ExitOnError(expected.takeError());
-    }
-    auto binary = expected->getBinary();
+    uint64_t image_base = json["image_base"].get<uint64_t>();
+    g_is64 = json["is64"].get<bool>();
 
-    std::cout << "filename=" << exe_path << " type=0x" << std::hex << binary->getType() << std::endl;
-    if (!binary->isCOFF())
-        throw std::runtime_error("executable is not a COFF/PE file: " + exe_path.string());
-
-    coff = llvm::dyn_cast<llvm::object::COFFObjectFile>(binary);
-
-    // Build section cache once via index-based access — the compiled library's
-    // section iterator operator++ calls getSectionName internally and crashes on
-    // large PE files, so we bypass the iterator entirely.
     section_cache.clear();
-    bool isPE = coff->getDOSHeader() != nullptr;
-    uint32_t numSections = coff->getNumberOfSections();
-    for (uint32_t i = 1; i <= numSections; ++i) {
-        auto sec_expected = coff->getSection(i);
-        if (!sec_expected) { consumeError(sec_expected.takeError()); continue; }
-        const llvm::object::coff_section *s = *sec_expected;
-        uint64_t start = static_cast<uint64_t>(s->VirtualAddress) + coff->getImageBase();
-        uint64_t size  = isPE ? std::min(s->VirtualSize, s->SizeOfRawData) : s->SizeOfRawData;
-        section_cache.push_back({start, start + size, static_cast<uint16_t>(i)});
+    std::vector<llvm::object::coff_section> sectionHeaders;
+    uint16_t segIndex = 1;
+    for (auto &sj : json["sections"]) {
+        std::string name = sj["name"].get<std::string>();
+        uint32_t va = sj["virtual_address"].get<uint32_t>();
+        uint32_t vsize = sj["virtual_size"].get<uint32_t>();
+        uint32_t rawsize = sj["size_of_raw_data"].get<uint32_t>();
+        uint32_t chars = sj["characteristics"].get<uint32_t>();
+
+        uint64_t start = image_base + va;
+        uint64_t size = std::min(vsize, rawsize);
+        section_cache.push_back({start, start + size, segIndex});
+
+        llvm::object::coff_section cs = {};
+        std::memset(cs.Name, 0, sizeof(cs.Name));
+        std::memcpy(cs.Name, name.data(), std::min(name.size(), sizeof(cs.Name)));
+        cs.VirtualSize = vsize;
+        cs.VirtualAddress = va;
+        cs.SizeOfRawData = rawsize;
+        cs.PointerToRawData = 0;
+        cs.PointerToRelocations = 0;
+        cs.PointerToLinenumbers = 0;
+        cs.NumberOfRelocations = 0;
+        cs.NumberOfLinenumbers = 0;
+        cs.Characteristics = chars;
+        sectionHeaders.push_back(cs);
+
+        segIndex++;
     }
     std::cout << "sections: " << std::dec << section_cache.size() << std::endl;
 
@@ -660,28 +688,14 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
     dbi.setPdbDllRbld(0);
     dbi.setPdbDllVersion(29111);
     dbi.setVersionHeader(llvm::pdb::PdbDbiV70);
-    for (llvm::object::debug_directory const &dir : coff->debug_directories()) {
-        info.setSignature(dir.TimeDateStamp);
-        if (dir.Type != llvm::COFF::IMAGE_DEBUG_TYPE_CODEVIEW) {
-            continue;
-        }
 
-        llvm::StringRef filename;
-        const llvm::codeview::DebugInfo *debug;
-        ExitOnError(coff->getDebugPDBInfo(debug, filename));
+    info.setSignature(json["time_date_stamp"].get<uint32_t>());
+    uint32_t age = json["pdb_age"].get<uint32_t>();
+    info.setAge(age);
+    dbi.setAge(age);
+    info.setGuid(parseGuid(json["pdb_guid"].get<std::string>()));
 
-        if (debug->Signature.CVSignature != llvm::OMF::Signature::PDB70) {
-            continue;
-        }
-
-        llvm::codeview::GUID guid;
-        info.setAge(debug->PDB70.Age);
-        dbi.setAge(debug->PDB70.Age);
-        std::memcpy(&guid, debug->PDB70.Signature, sizeof(guid));
-        info.setGuid(guid);
-    }
-
-    if (coff->is64()) {
+    if (g_is64) {
         dbi.setMachineType(llvm::pdb::PDB_Machine::Amd64);
     } else {
         dbi.setMachineType(llvm::pdb::PDB_Machine::x86);
@@ -807,6 +821,7 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
 
         llvm::codeview::ProcRefSym pr(llvm::codeview::SymbolKind::S_PROCREF);
 
+        try {
         switch (type) {
         case SymbolType::S_PUB32:
             publics.push_back(std::move(entry.get<llvm::pdb::BulkPublic>()));
@@ -841,6 +856,12 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
         default:
             std::cerr << "unknown symbol type: " << entry << std::endl;
             break;
+        }
+        } catch (const std::runtime_error &e) {
+            // BSS/virtual-only addresses have no file-backed section offset; skip rather
+            // than abort the whole build.
+            std::cerr << "[pdbgen] skipping unmappable symbol: " << e.what() << std::endl;
+            continue;
         }
     }
 
@@ -906,27 +927,7 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
     // Add Section Map + Section Header streams.
     // We need this or DIA/windbg won't resolve public symbols by address: DIA uses the section
     // headers to translate an RVA into the section:offset space the publics live in.
-    //
-    // Build the section-header array via index-based getSection(i), copying each record into a
-    // stable, contiguous vector. The previous code took a single pointer from the coff->sections()
-    // iterator (getCOFFSection) and assumed `count` contiguous records via ArrayRef(firstPtr, count).
-    // On large PE files that pointer is unstable — the iterator's operator++ touches the backing
-    // MemoryBuffer (the same defect noted for map_address_to_offset) — so the SectionHdr stream came
-    // out garbage (.text lost its name, VirtualAddress was random) and findSymbolByRVA failed for
-    // every frame ("No public symbol found"). Index-based getSection(i) is stable.
-    uint32_t count = coff->getNumberOfSections();
-    std::vector<llvm::object::coff_section> sectionHeaders;
-    sectionHeaders.reserve(count);
-    for (uint32_t i = 1; i <= count; ++i) {
-        auto sec_expected = coff->getSection(i);
-        if (!sec_expected) {
-            consumeError(sec_expected.takeError());
-            continue;
-        }
-        const llvm::object::coff_section *s = *sec_expected;
-        sectionHeaders.push_back(*s);
-    }
-
+    // sectionHeaders was already built from JSON above, alongside section_cache.
     llvm::ArrayRef<llvm::object::coff_section> sections(sectionHeaders.data(), sectionHeaders.size());
     dbi.createSectionMap(sections);
     auto sectionsTable = llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(sections.begin()),
@@ -942,14 +943,12 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
 
 int main(int argc, char **argv) {
     bool show_help = false;
-    std::string exe_path;
     std::string json_path;
     std::string output_path;
 
     auto cli = lyra::cli();
     cli |= lyra::help(show_help);
-    cli |= lyra::arg(exe_path, "executable").required().help("The path to the original executable");
-    cli |= lyra::arg(json_path, "json").help("The json file emitted from ghidra");
+    cli |= lyra::arg(json_path, "json").required().help("The json file emitted from ghidra (\"-\" to read from stdin)");
     cli |= lyra::opt(output_path, "path")["-o"]["--output"].help("The path to save the new .pdb");
 
     auto result = cli.parse({argc, argv});
@@ -964,24 +963,21 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    std::filesystem::path exe = std::filesystem::absolute(exe_path);
-
-    std::filesystem::path json = std::filesystem::absolute(json_path);
-    if (json_path.empty()) {
-        json = std::filesystem::path(exe);
-        json.replace_extension(".json");
-    } else if (json_path == "-") {
-        // we will read from stdin
-        json.clear();
+    std::filesystem::path json;
+    if (json_path != "-") {
+        json = std::filesystem::absolute(json_path);
     }
 
     std::filesystem::path pdb = std::filesystem::absolute(output_path);
     if (pdb.empty()) {
-        pdb = std::filesystem::path(exe);
+        if (json.empty()) {
+            std::cerr << "--output is required when reading json from stdin" << std::endl;
+            return 1;
+        }
+        pdb = json;
         pdb.replace_extension(".pdb");
     }
 
-    std::cout << "exe: " << exe << std::endl;
     if (json.empty()) {
         std::cout << "json: <stdin>" << std::endl;
     } else {
@@ -989,20 +985,13 @@ int main(int argc, char **argv) {
     }
     std::cout << "pdb: " << pdb << std::endl;
 
-    if (!std::filesystem::exists(exe)) {
-        std::cerr << exe << " does not exist" << std::endl;
-        return 2;
-    }
-
-    if (!json.empty() and !std::filesystem::exists(json)) {
+    if (!json.empty() && !std::filesystem::exists(json)) {
         std::cerr << json << " does not exist" << std::endl;
         return 2;
     }
 
-    //return process(exe, json, pdb);
-
     try {
-        return process(exe, json, pdb);
+        return process(json, pdb);
     } catch (const nlohmann::json::exception& e) {
         std::cout << "failed to parse json: " << e.what() << std::endl;
         return -1;
