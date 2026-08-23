@@ -1027,12 +1027,8 @@ public class PdbGen extends GhidraScript {
 					name = "thunk_" + name;
 				}
 
-				// A function whose entry is not in an executable section cannot be a
-				// CodeView procedure (S_GPROC32 needs a code segment); pdbgen aborts the
-				// entire PDB on the unmappable address. Emit it as a public data symbol so
-				// the name survives and generation continues. Seen for analysis false
-				// positives in .data/.rdata and CommonLib inline accessors whose
-				// RELOCATION_ID points at the singleton/array data they return.
+				// S_GPROC32 needs a code segment; a function outside one aborts pdbgen --
+				// emit as S_PUB32 data instead.
 				ghidra.program.model.mem.MemoryBlock block = currentProgram.getMemory().getBlock(address);
 				if (block == null || !block.isExecute()) {
 					JsonObject data = new JsonObject();

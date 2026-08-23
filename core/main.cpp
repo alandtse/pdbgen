@@ -844,10 +844,8 @@ int process(std::filesystem::path exe_path, std::filesystem::path json_path, std
             break;
         }
         } catch (const std::runtime_error &e) {
-            // A symbol whose address falls in a BSS / virtual-only region has no file-backed
-            // section offset (section_cache uses min(VirtualSize, SizeOfRawData)) and cannot be
-            // placed in the PDB. Skip it with a warning instead of aborting the whole build --
-            // these are uninitialized-data globals, irrelevant to call-stack symbolication.
+            // BSS/virtual-only addresses have no file-backed section offset; skip rather
+            // than abort the whole build.
             std::cerr << "[pdbgen] skipping unmappable symbol: " << e.what() << std::endl;
             continue;
         }
