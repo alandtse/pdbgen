@@ -24,6 +24,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 import org.apache.commons.io.FilenameUtils;
 
@@ -130,6 +132,159 @@ public class PdbGen extends GhidraScript {
 		}
 		printf("  %s\n", "-".repeat(74));
 		printf(fmtTotal, "Total", toString(total), totalItems);
+	}
+
+	/**
+	 * Ghidra's recorded executable path can go stale if the binary is later renamed or moved
+	 * (e.g. a game exe gets renamed as it's patched: SkyrimSE.1.7.79.exe -> SkyrimSE.1.7.99.exe,
+	 * while Ghidra's project still remembers the old path/name). If the recorded path no longer
+	 * exists, resolve it in two steps: first, search its directory for a same-extension file
+	 * whose MD5 matches the MD5 Ghidra captured at import time (a confirmed match -- but this
+	 * never succeeds for a Steamless-stripped copy, since removing the DRM stub changes the
+	 * bytes even when the underlying game build is identical); failing that, fall back to a
+	 * same-prefix file in the same directory whose PE VersionInfo.FileVersion matches the
+	 * version encoded in the recorded filename (e.g. SkyrimSE.1.7.79.exe -> "1.7.79" must appear
+	 * in the candidate's FileVersion) -- VERSIONINFO survives DRM stripping, so this still gives
+	 * a real, verified signal instead of guessing off the filename alone. Output naming always
+	 * derives from the (possibly stale) recorded path, so concurrent runs against different game
+	 * versions keep distinct output filenames.
+	 */
+	private String resolveExecutablePath(String recordedPath) {
+		File recorded = new File(recordedPath);
+		if (recorded.exists()) {
+			return recordedPath;
+		}
+
+		String expectedMd5 = currentProgram.getExecutableMD5();
+		File dir = recorded.getParentFile();
+		if (expectedMd5 == null || dir == null || !dir.isDirectory()) {
+			return null;
+		}
+
+		String ext = FilenameUtils.getExtension(recordedPath).toLowerCase();
+		File[] candidates = dir.listFiles((d, name) -> ext.isEmpty() || name.toLowerCase().endsWith("." + ext));
+		if (candidates == null) {
+			return null;
+		}
+
+		String match = null;
+		for (File candidate : candidates) {
+			try {
+				if (expectedMd5.equalsIgnoreCase(md5(candidate))) {
+					if (match != null) {
+						printf("[PDBGEN] WARNING: multiple files match MD5 for stale path '%s': %s and %s -- refusing to guess\n",
+								recordedPath, match, candidate);
+						return null;
+					}
+					match = candidate.getAbsolutePath();
+				}
+			} catch (IOException e) {
+				printf("[PDBGEN] WARNING: failed to hash %s: %s\n", candidate, e);
+			}
+		}
+
+		if (match != null) {
+			printf("[PDBGEN] recorded executable path is stale ('%s' no longer exists); resolved actual file by MD5 match: %s\n",
+					recordedPath, match);
+			return match;
+		}
+
+		// Last resort: the recorded filename encodes a game version (e.g. SkyrimSE.1.7.79.exe
+		// or SkyrimSE.1170.exe). Look for a same-prefix candidate whose actual PE FileVersion
+		// resource contains that version -- unlike a bare filename guess, this is still a real
+		// (if weaker than MD5) confirmation, and it works across DRM stripping.
+		String baseName = FilenameUtils.getBaseName(recordedPath);
+		int firstDot = baseName.indexOf('.');
+		if (firstDot < 0) {
+			return null;
+		}
+		String prefix = baseName.substring(0, firstDot);
+		String versionToken = baseName.substring(firstDot + 1);
+
+		String versionMatch = null;
+		for (File candidate : candidates) {
+			if (!candidate.getName().startsWith(prefix)) {
+				continue;
+			}
+			String fileVersion = getFileVersion(candidate);
+			if (fileVersion == null || !versionContains(fileVersion, versionToken)) {
+				continue;
+			}
+			if (versionMatch != null) {
+				printf("[PDBGEN] WARNING: multiple files match version '%s' for stale path '%s' -- refusing to guess\n",
+						versionToken, recordedPath);
+				return null;
+			}
+			versionMatch = candidate.getAbsolutePath();
+		}
+
+		if (versionMatch != null) {
+			printf("[PDBGEN] no MD5 match for stale path '%s' (expected after Steamless DRM stripping); resolved by FileVersion match ('%s'): %s\n",
+					recordedPath, versionToken, versionMatch);
+		}
+		return versionMatch;
+	}
+
+	// Reads the PE VersionInfo.FileVersion of a file via PowerShell, since the JDK has no
+	// built-in way to read Win32 file version resources. Returns null on any failure.
+	private static String getFileVersion(File file) {
+		try {
+			String escaped = file.getAbsolutePath().replace("'", "''");
+			ProcessBuilder pb = new ProcessBuilder("powershell", "-NoProfile", "-NonInteractive", "-Command",
+					"(Get-Item -LiteralPath '" + escaped + "').VersionInfo.FileVersion");
+			pb.redirectErrorStream(true);
+			Process p = pb.start();
+			String line;
+			try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+				line = r.readLine();
+			}
+			p.waitFor(5, TimeUnit.SECONDS);
+			return line == null || line.isBlank() ? null : line.trim();
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	// True if the dot-separated numeric components of `token` (e.g. "1.7.79" or "1170") appear
+	// as a contiguous, ordered run within the dot-separated components of `fileVersion`
+	// (e.g. "1.7.79.0" or "1.6.1170.0"). Plain substring/digit matching would false-positive
+	// across differing naming conventions (dotted SE versions vs bare AE build numbers).
+	private static boolean versionContains(String fileVersion, String token) {
+		String[] a = token.split("[^0-9]+");
+		String[] b = fileVersion.split("[^0-9]+");
+		if (a.length == 0 || a.length > b.length) {
+			return false;
+		}
+		outer:
+		for (int start = 0; start + a.length <= b.length; start++) {
+			for (int i = 0; i < a.length; i++) {
+				if (!a[i].equals(b[start + i])) {
+					continue outer;
+				}
+			}
+			return true;
+		}
+		return false;
+	}
+
+	private static String md5(File file) throws IOException {
+		try {
+			MessageDigest digest = MessageDigest.getInstance("MD5");
+			try (InputStream in = new java.io.FileInputStream(file)) {
+				byte[] buf = new byte[1 << 16];
+				int n;
+				while ((n = in.read(buf)) > 0) {
+					digest.update(buf, 0, n);
+				}
+			}
+			StringBuilder sb = new StringBuilder();
+			for (byte b : digest.digest()) {
+				sb.append(String.format("%02x", b));
+			}
+			return sb.toString();
+		} catch (NoSuchAlgorithmException e) {
+			throw new IOException(e);
+		}
 	}
 
 	private void printPdbSummary(String pdbPath, JsonObject data) {
@@ -1234,10 +1389,11 @@ public class PdbGen extends GhidraScript {
 
 		// Ghidra has unhelpfully set the path to \C:\\Something\ this gives as a normal
 		// c:\\Something
-		String exepath = Path.fromPathString(currentProgram.getExecutablePath()).toString();
-		printf("executable: %s\n", exepath);
-		String output = FilenameUtils.removeExtension(exepath).concat(".pdb");
-		String jsonpath = FilenameUtils.removeExtension(exepath).concat(".json");
+		String recordedExePath = Path.fromPathString(currentProgram.getExecutablePath()).toString();
+		printf("executable: %s\n", recordedExePath);
+		String output = FilenameUtils.removeExtension(recordedExePath).concat(".pdb");
+		String jsonpath = FilenameUtils.removeExtension(recordedExePath).concat(".json");
+		String exepath = resolveExecutablePath(recordedExePath);
 
 		updateMonitor("Saving files");
 		boolean skipPdbGen = false;
@@ -1253,6 +1409,12 @@ public class PdbGen extends GhidraScript {
 		} catch (FileNotFoundException e) {
 			skipPdbGen = true;
 			printf("Unable to save: %s\n;", e);
+		}
+
+		if (exepath == null) {
+			skipPdbGen = true;
+			printf("[PDBGEN] FAILED: executable not found at '%s' and no file in that folder matches this program's MD5 -- skipping pdbgen.exe. JSON was still written to %s\n",
+					recordedExePath, jsonpath);
 		}
 		// simple configurable path
 		// Ghidra will cache the default value here, and it will prefer its internal
